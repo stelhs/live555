@@ -21,9 +21,19 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 // then we don't recommend using this code as a model, because it is too complex (with many options).
 // Instead, we recommend using the "testRTSPClient" application code as a model.
 
+#include <libgen.h>
+#include <sys/stat.h>
+#include <ctime>
+
 #include "playCommon.hh"
 #include "BasicUsageEnvironment.hh"
 #include "GroupsockHelper.hh"
+
+#include <cppconn/driver.h>
+#include <cppconn/exception.h>
+#include <cppconn/resultset.h>
+#include <cppconn/statement.h>
+#include <cppconn/prepared_statement.h>
 
 #if defined(__WIN32__) || defined(_WIN32)
 #define snprintf _snprintf
@@ -56,6 +66,9 @@ void checkForPacketArrival(void* clientData);
 void checkInterPacketGaps(void* clientData);
 void checkSessionTimeoutBrokenServer(void* clientData);
 void beginQOSMeasurement();
+void dbConnect();
+void dBdisconnect();
+void dbInsVideosRow(const char *camName, const char *fname, unsigned int duration);
 
 char const* progName;
 UsageEnvironment* env;
@@ -113,6 +126,7 @@ Boolean movieHeightOptionSet = False;
 unsigned movieFPS = 15; // default
 Boolean movieFPSOptionSet = False;
 char const* fileNamePrefix = "";
+char const* rtspSourceName = "";
 unsigned fileSinkBufferSize = 100000;
 unsigned socketInputBufferSize = 0;
 Boolean packetLossCompensate = False;
@@ -129,6 +143,10 @@ HandlerServerForREGISTERCommand* handlerServerForREGISTERCommand;
 char* usernameForREGISTER = NULL;
 char* passwordForREGISTER = NULL;
 UserAuthenticationDatabase* authDBForREGISTER = NULL;
+
+sql::PreparedStatement *mySqlPstmt;
+sql::Connection *mySqlCon;
+bool dbConnected = false;
 
 struct timeval startTime;
 
@@ -424,6 +442,12 @@ int main(int argc, char** argv) {
       break;
     }
 
+    case 'N': { // specify a video camera name
+      rtspSourceName = argv[2];
+      ++argv; --argc;
+      break;
+    }
+
     case 'g': { // specify a user agent name to use in outgoing requests
       userAgent = argv[2];
       ++argv; --argc;
@@ -625,11 +649,67 @@ int main(int argc, char** argv) {
     continueAfterClientCreation1();
   }
 
+  // initializing database
+  if (rtspSourceName[0])
+    dbConnect();
+
   // All subsequent activity takes place within the event loop:
   env->taskScheduler().doEventLoop(); // does not return
 
   return 0; // only to prevent compiler warning
 }
+
+void dbConnect()
+{
+  if (dbConnected)
+    return;
+
+  try {
+    sql::Driver *driver;
+
+    driver = get_driver_instance();
+    mySqlCon = driver->connect("tcp://127.0.0.1:3306", "login", "pass");
+    mySqlCon->setSchema("database");
+    mySqlPstmt = mySqlCon->prepareStatement(
+                        "insert into videos(cam_name, fname, duration) "
+                        "values (?, ?, ?)");
+    dbConnected = true;
+  } catch (sql::SQLException &e) {
+    printf("ERR: SQLException in %s:%s() +%d. Reason: %s, "
+           "MySQL error code: %d, SQLState: %s\n",
+           __FILE__, __FUNCTION__, __LINE__, e.what(),
+           e.getErrorCode(), e.getSQLState().c_str());
+    dbConnected = false;
+  }
+}
+
+void dBdisconnect()
+{
+  if (!dbConnected)
+    return;
+  delete mySqlPstmt;
+  delete mySqlCon;
+  dbConnected = false;
+}
+
+void dbInsVideosRow(const char *camName, const char *fname, unsigned int duration)
+{
+  if (!dbConnected) {
+    dbConnect();
+    return;
+  }
+
+  try {
+    mySqlPstmt->setString(1, camName);
+    mySqlPstmt->setString(2, fname);
+    mySqlPstmt->setInt(3, duration);
+    mySqlPstmt->executeUpdate();
+  } catch (sql::SQLException &e) {
+    dBdisconnect();
+    dbConnect();
+  }
+}
+
 
 void continueAfterClientCreation0(RTSPClient* newRTSPClient, Boolean requestStreamingOverTCP) {
   if (newRTSPClient == NULL) return;
@@ -734,14 +814,13 @@ void continueAfterDESCRIBE(RTSPClient*, int resultCode, char* resultString) {
 	}
 	*env << ")\n";
 	madeProgress = True;
-	
 	if (subsession->rtpSource() != NULL) {
 	  // Because we're saving the incoming data, rather than playing
 	  // it in real time, allow an especially large time threshold
 	  // (1 second) for reordering misordered incoming packets:
 	  unsigned const thresh = 1000000; // 1 second
 	  subsession->rtpSource()->setPacketReorderingThresholdTime(thresh);
-	  
+
 	  // Set the RTP source's OS socket buffer size as appropriate - either if we were explicitly asked (using -B),
 	  // or if the desired FileSink buffer size happens to be larger than the current OS socket buffer size.
 	  // (The latter case is a heuristic, on the assumption that if the user asked for a large FileSink buffer size,
@@ -807,6 +886,23 @@ void continueAfterSETUP(RTSPClient* client, int resultCode, char* resultString) 
   setupStreams();
 }
 
+int mkpath(const char *dir, mode_t mode)
+{
+    struct stat sb;
+
+    if (!dir) {
+        errno = EINVAL;
+        return 1;
+    }
+
+    if (!stat(dir, &sb))
+        return 0;
+
+    mkpath(dirname(strdupa(dir)), mode);
+
+    return mkdir(dir, mode);
+}
+
 void createOutputFiles(char const* periodicFilenameSuffix) {
   char outFileName[1000];
 
@@ -816,9 +912,21 @@ void createOutputFiles(char const* periodicFilenameSuffix) {
       sprintf(outFileName, "stdout");
     } else {
       // Otherwise output to a type-specific file name, containing "periodicFilenameSuffix":
-      char const* prefix = fileNamePrefix[0] == '\0' ? "output" : fileNamePrefix;
-      snprintf(outFileName, sizeof outFileName, "%s%s.%s", prefix, periodicFilenameSuffix,
-	       outputAVIFile ? "avi" : generateMP4Format ? "mp4" : "mov");
+      char path[1024];
+      time_t now = time(0);
+      tm *ltm = localtime(&now);
+
+      snprintf(path, sizeof path, "%s/%d/%d/%d/%s",
+              fileNamePrefix, 1900 + ltm->tm_year,
+              1 + ltm->tm_mon, ltm->tm_mday, rtspSourceName);
+
+      mkpath(path, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+
+      snprintf(outFileName, sizeof outFileName, "%s/%02d_%02d_%02d.%s",
+              path, ltm->tm_hour, ltm->tm_min, ltm->tm_sec,
+              outputAVIFile ? "avi" : generateMP4Format ? "mp4" : "mov");
+
+      dbInsVideosRow(rtspSourceName, outFileName, fileOutputInterval);
     }
 
     if (outputQuickTimeFile) {
@@ -837,7 +945,7 @@ void createOutputFiles(char const* periodicFilenameSuffix) {
       } else {
 	*env << "Outputting to the file: \"" << outFileName << "\"\n";
       }
-      
+
       qtOut->startPlaying(sessionAfterPlaying, NULL);
     } else { // outputAVIFile
       aviOut = AVIFileSink::createNew(*env, *session, outFileName,
@@ -852,7 +960,7 @@ void createOutputFiles(char const* periodicFilenameSuffix) {
       } else {
 	*env << "Outputting to the file: \"" << outFileName << "\"\n";
       }
-      
+
       aviOut->startPlaying(sessionAfterPlaying, NULL);
     }
   } else {
@@ -861,7 +969,7 @@ void createOutputFiles(char const* periodicFilenameSuffix) {
     MediaSubsessionIterator iter(*session);
     while ((subsession = iter.next()) != NULL) {
       if (subsession->readSource() == NULL) continue; // was not initiated
-      
+
       // Create an output file for each desired stream:
       if (singleMedium == NULL || periodicFilenameSuffix[0] != '\0') {
 	// Output file name is
@@ -929,7 +1037,7 @@ void createOutputFiles(char const* periodicFilenameSuffix) {
 	       << "/" << subsession->codecName()
 	       << "\" subsession to \"" << outFileName << "\"\n";
 	}
-	
+
 	if (strcmp(subsession->mediumName(), "video") == 0 &&
 	    strcmp(subsession->codecName(), "MP4V-ES") == 0 &&
 	    subsession->fmtp_config() != NULL) {
@@ -944,17 +1052,17 @@ void createOutputFiles(char const* periodicFilenameSuffix) {
 	  fileSink->addData(configData, configLen, timeNow);
 	  delete[] configData;
 	}
-	
+
 	subsession->sink->startPlaying(*(subsession->readSource()),
 				       subsessionAfterPlaying,
 				       subsession);
-	
+
 	// Also set a handler to be called if a RTCP "BYE" arrives
 	// for this subsession:
 	if (subsession->rtcpInstance() != NULL) {
 	  subsession->rtcpInstance()->setByeWithReasonHandler(subsessionByeHandler, subsession);
 	}
-	
+
 	madeProgress = True;
       }
     }
@@ -1301,7 +1409,7 @@ void beginQOSMeasurement() {
 
 void printQOSData(int exitCode) {
   *env << "begin_QOS_statistics\n";
-  
+
   // Print out stats for each active subsession:
   qosMeasurementRecord* curQOSRecord = qosRecordHead;
   if (session != NULL) {
@@ -1310,19 +1418,19 @@ void printQOSData(int exitCode) {
     while ((subsession = iter.next()) != NULL) {
       RTPSource* src = subsession->rtpSource();
       if (src == NULL) continue;
-      
+
       *env << "subsession\t" << subsession->mediumName()
 	   << "/" << subsession->codecName() << "\n";
-      
+
       unsigned numPacketsReceived = 0, numPacketsExpected = 0;
-      
+
       if (curQOSRecord != NULL) {
 	numPacketsReceived = curQOSRecord->totNumPacketsReceived;
 	numPacketsExpected = curQOSRecord->totNumPacketsExpected;
       }
       *env << "num_packets_received\t" << numPacketsReceived << "\n";
       *env << "num_packets_lost\t" << int(numPacketsExpected - numPacketsReceived) << "\n";
-      
+
       if (curQOSRecord != NULL) {
 	unsigned secsDiff = curQOSRecord->measurementEndTime.tv_sec
 	  - curQOSRecord->measurementStartTime.tv_sec;
@@ -1330,11 +1438,11 @@ void printQOSData(int exitCode) {
 	  - curQOSRecord->measurementStartTime.tv_usec;
 	double measurementTime = secsDiff + usecsDiff/1000000.0;
 	*env << "elapsed_measurement_time\t" << measurementTime << "\n";
-	
+
 	*env << "kBytes_received_total\t" << curQOSRecord->kBytesTotal << "\n";
-	
+
 	*env << "measurement_sampling_interval_ms\t" << qosMeasurementIntervalMS << "\n";
-	
+
 	if (curQOSRecord->kbits_per_second_max == 0) {
 	  // special case: we didn't receive any data:
 	  *env <<
@@ -1347,7 +1455,7 @@ void printQOSData(int exitCode) {
 	       << (measurementTime == 0.0 ? 0.0 : 8*curQOSRecord->kBytesTotal/measurementTime) << "\n";
 	  *env << "kbits_per_second_max\t" << curQOSRecord->kbits_per_second_max << "\n";
 	}
-	
+
 	*env << "packet_loss_percentage_min\t" << 100*curQOSRecord->packet_loss_fraction_min << "\n";
 	double packetLossFraction = numPacketsExpected == 0 ? 1.0
 	  : 1.0 - numPacketsReceived/(double)numPacketsExpected;
@@ -1355,7 +1463,7 @@ void printQOSData(int exitCode) {
 	*env << "packet_loss_percentage_ave\t" << 100*packetLossFraction << "\n";
 	*env << "packet_loss_percentage_max\t"
 	     << (packetLossFraction == 1.0 ? 100.0 : 100*curQOSRecord->packet_loss_fraction_max) << "\n";
-	
+
 	RTPReceptionStatsDB::Iterator statsIter(src->receptionStatsDB());
 	// Assume that there's only one SSRC source (usually the case):
 	RTPReceptionStats* stats = statsIter.next(True);
@@ -1368,7 +1476,7 @@ void printQOSData(int exitCode) {
 	       << (totNumPacketsReceived == 0 ? 0.0 : totalGapsMS/totNumPacketsReceived) << "\n";
 	  *env << "inter_packet_gap_ms_max\t" << stats->maxInterPacketGapUS()/1000.0 << "\n";
 	}
-	
+
 	curQOSRecord = curQOSRecord->fNext;
       }
     }
@@ -1528,13 +1636,13 @@ void checkSessionTimeoutBrokenServer(void* /*clientData*/) {
   if (sessionTimeoutBrokenServerTask != NULL) {
     getOptions(NULL);
   }
-  
+
   unsigned sessionTimeout = sessionTimeoutParameter == 0 ? 60/*default*/ : sessionTimeoutParameter;
   unsigned secondsUntilNextKeepAlive = sessionTimeout <= 5 ? 1 : sessionTimeout - 5;
       // Reduce the interval a little, to be on the safe side
 
-  sessionTimeoutBrokenServerTask 
+  sessionTimeoutBrokenServerTask
     = env->taskScheduler().scheduleDelayedTask(secondsUntilNextKeepAlive*1000000,
 			 (TaskFunc*)checkSessionTimeoutBrokenServer, NULL);
-					       
+
 }

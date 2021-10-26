@@ -29,3 +29,17 @@ The remote endpoint is using a buggy implementation of RTP/RTCP-over-TCP.  Pleas
 ### Add -d option
 See Proxyserver_check_interPacketGap_2017.01.26.patch - This allows specifying a number of seconds of inactivity
 before timing out the connection.
+
+
+### Video-recorder functionality
+For example:
+   openRTSP -K -b 1000000 -4 -P 60 -c -t -F /storage/video-records -N camera1 rtsp://192.168.10.52/stream
+
+Subdirectories will be created in the directory /storage/video-records with mp4 files:
+    /storage/video-records/2021/10/27/13_05_47.mp4
+                                      13_06_46.mp4
+                                      13_07_47.mp4
+                                      ...
+
+All file names stored in the MySQL table 'videos'.
+For More information see testProgs/playCommon.cpp:dbConnect()
