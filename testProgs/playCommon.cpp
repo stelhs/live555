@@ -68,7 +68,7 @@ void checkSessionTimeoutBrokenServer(void* clientData);
 void beginQOSMeasurement();
 void dbConnect();
 void dBdisconnect();
-void dbInsVideosRow(const char *camName, const char *fname, unsigned int duration);
+int dbInsVideosRow(const char *camName, const char *fname, unsigned int duration);
 
 char const* progName;
 UsageEnvironment* env;
@@ -127,6 +127,7 @@ unsigned movieFPS = 15; // default
 Boolean movieFPSOptionSet = False;
 char const* fileNamePrefix = "";
 char const* rtspSourceName = "";
+char const* pidFileName = "";
 unsigned fileSinkBufferSize = 100000;
 unsigned socketInputBufferSize = 0;
 Boolean packetLossCompensate = False;
@@ -144,9 +145,11 @@ char* usernameForREGISTER = NULL;
 char* passwordForREGISTER = NULL;
 UserAuthenticationDatabase* authDBForREGISTER = NULL;
 
-sql::PreparedStatement *mySqlPstmt;
+sql::PreparedStatement *mySqlInsertVideos, *mySqlUpdateVideos;
+sql::Statement *mySQLSelect;
 sql::Connection *mySqlCon;
 bool dbConnected = false;
+int dbVideosLastId = 0;
 
 struct timeval startTime;
 
@@ -448,6 +451,12 @@ int main(int argc, char** argv) {
       break;
     }
 
+    case 'j': { // specify PID file
+      pidFileName = argv[2];
+      ++argv; --argc;
+      break;
+    }
+
     case 'g': { // specify a user agent name to use in outgoing requests
       userAgent = argv[2];
       ++argv; --argc;
@@ -629,6 +638,15 @@ int main(int argc, char** argv) {
 
   streamURL = argv[1];
 
+  if (pidFileName[0]) {
+    char str[10];
+    int len;
+    FILE *f = fopen(pidFileName, "w");
+    len = snprintf(str, sizeof str, "%d", getpid());
+    fwrite(str, 1, len, f);
+    fclose(f);
+  }
+
   // Create (or arrange to create) our client object:
   if (createHandlerServerForREGISTERCommand) {
     handlerServerForREGISTERCommand
@@ -666,13 +684,19 @@ void dbConnect()
 
   try {
     sql::Driver *driver;
+    char str[1024];
+    #include "db_config.h"
 
     driver = get_driver_instance();
-    mySqlCon = driver->connect("tcp://127.0.0.1:3306", "login", "pass");
-    mySqlCon->setSchema("database");
-    mySqlPstmt = mySqlCon->prepareStatement(
+    snprintf(str, sizeof str, "tcp://%s:%d", host, port);
+    mySqlCon = driver->connect(str, login, pass);
+    mySqlCon->setSchema(db_name);
+    mySqlInsertVideos = mySqlCon->prepareStatement(
                         "insert into videos(cam_name, fname, duration) "
                         "values (?, ?, ?)");
+    mySqlUpdateVideos = mySqlCon->prepareStatement(
+                        "update videos set file_size = ? where id = ?");
+    mySQLSelect = mySqlCon->createStatement();
     dbConnected = true;
   } catch (sql::SQLException &e) {
     printf("ERR: SQLException in %s:%s() +%d. Reason: %s, "
@@ -687,12 +711,48 @@ void dBdisconnect()
 {
   if (!dbConnected)
     return;
-  delete mySqlPstmt;
+  delete mySqlInsertVideos;
+  delete mySqlUpdateVideos;
+  delete mySQLSelect;
   delete mySqlCon;
   dbConnected = false;
 }
 
-void dbInsVideosRow(const char *camName, const char *fname, unsigned int duration)
+int dbInsVideosRow(const char *camName, const char *fname, unsigned int duration)
+{
+  if (!dbConnected) {
+    dbConnect();
+    return 0;
+  }
+
+  try {
+    sql::ResultSet *res;
+    int last_id = 0;
+
+    mySqlInsertVideos->setString(1, camName);
+    mySqlInsertVideos->setString(2, fname);
+    mySqlInsertVideos->setInt(3, duration);
+    mySqlInsertVideos->executeUpdate();
+
+    res = mySQLSelect->executeQuery("select LAST_INSERT_ID() as id");
+    while (res->next()) {
+      last_id = res->getInt("id");
+      printf("row id = %d\n", last_id);
+    }
+    dbVideosLastId = last_id;
+    return last_id;
+  } catch (sql::SQLException &e) {
+    printf("ERR: SQLException in %s:%s() +%d. Reason: %s, "
+               "MySQL error code: %d, SQLState: %s\n",
+               __FILE__, __FUNCTION__, __LINE__, e.what(),
+               e.getErrorCode(), e.getSQLState().c_str());
+    dBdisconnect();
+    dbConnect();
+  }
+  return 0;
+}
+
+void dbUpdateVideoRow(int file_size)
 {
   if (!dbConnected) {
     dbConnect();
@@ -700,11 +760,14 @@ void dbInsVideosRow(const char *camName, const char *fname, unsigned int duratio
   }
 
   try {
-    mySqlPstmt->setString(1, camName);
-    mySqlPstmt->setString(2, fname);
-    mySqlPstmt->setInt(3, duration);
-    mySqlPstmt->executeUpdate();
+    mySqlUpdateVideos->setInt(1, file_size);
+    mySqlUpdateVideos->setInt(2, dbVideosLastId);
+    mySqlUpdateVideos->executeUpdate();
   } catch (sql::SQLException &e) {
+    printf("ERR: SQLException in %s:%s() +%d. Reason: %s, "
+               "MySQL error code: %d, SQLState: %s\n",
+               __FILE__, __FUNCTION__, __LINE__, e.what(),
+               e.getErrorCode(), e.getSQLState().c_str());
     dBdisconnect();
     dbConnect();
   }
@@ -916,7 +979,7 @@ void createOutputFiles(char const* periodicFilenameSuffix) {
       time_t now = time(0);
       tm *ltm = localtime(&now);
 
-      snprintf(path, sizeof path, "%s/%d/%d/%d/%s",
+      snprintf(path, sizeof path, "%s/%04d-%02d/%02d/%s",
               fileNamePrefix, 1900 + ltm->tm_year,
               1 + ltm->tm_mon, ltm->tm_mday, rtspSourceName);
 
@@ -939,11 +1002,11 @@ void createOutputFiles(char const* periodicFilenameSuffix) {
 					   generateHintTracks,
 					   generateMP4Format);
       if (qtOut == NULL) {
-	*env << "Failed to create a \"QuickTimeFileSink\" for outputting to \""
-	     << outFileName << "\": " << env->getResultMsg() << "\n";
-	shutdown();
+	      *env << "Failed to create a \"QuickTimeFileSink\" for outputting to \""
+	      << outFileName << "\": " << env->getResultMsg() << "\n";
+	      shutdown();
       } else {
-	*env << "Outputting to the file: \"" << outFileName << "\"\n";
+	      *env << "Outputting to the file: \"" << outFileName << "\"\n";
       }
 
       qtOut->startPlaying(sessionAfterPlaying, NULL);

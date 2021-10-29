@@ -34,6 +34,8 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 
 #define H264_IDR_FRAME 0x65  //bit 8 == 0, bits 7-6 (ref) == 3, bits 5-0 (type) == 5
 
+void dbUpdateVideoRow(int file_size);
+
 ////////// SubsessionIOState, ChunkDescriptor ///////////
 // A structure used to represent the I/O state of each input 'subsession':
 
@@ -91,7 +93,7 @@ public:
 
 public:
   class SyncFrame *nextSyncFrame;
-  unsigned sfFrameNum;  
+  unsigned sfFrameNum;
 };
 
 // A 64-bit counter, used below:
@@ -327,7 +329,9 @@ QuickTimeFileSink::~QuickTimeFileSink() {
     delete ioState->fHintTrackForUs; // if any
     delete ioState;
   }
-
+  int fileSize = TellFile64(fOutFid);
+  printf("close file, size = %d\n", fileSize);
+  dbUpdateVideoRow(fileSize);
   // Finally, close our output file:
   CloseOutputFile(fOutFid);
 }
@@ -344,7 +348,7 @@ QuickTimeFileSink::createNew(UsageEnvironment& env,
 			     Boolean syncStreams,
 			     Boolean generateHintTracks,
 			     Boolean generateMP4Format) {
-  QuickTimeFileSink* newSink = 
+  QuickTimeFileSink* newSink =
     new QuickTimeFileSink(env, inputSession, outputFileName, bufferSize, movieWidth, movieHeight, movieFPS,
 			  packetLossCompensate, syncStreams, generateHintTracks, generateMP4Format);
   if (newSink == NULL || newSink->fOutFid == NULL) {
@@ -536,7 +540,7 @@ SubsessionIOState::SubsessionIOState(QuickTimeFileSink& sink,
 				     MediaSubsession& subsession)
   : fHintTrackForUs(NULL), fTrackHintedByUs(NULL),
     fOurSink(sink), fOurSubsession(subsession),
-    fLastPacketRTPSeqNum(0), fHaveBeenSynced(False), fQTTotNumSamples(0), 
+    fLastPacketRTPSeqNum(0), fHaveBeenSynced(False), fQTTotNumSamples(0),
     fHeadChunk(NULL), fTailChunk(NULL), fNumChunks(0),
     fHeadSyncFrame(NULL), fTailSyncFrame(NULL) {
   fTrackID = ++fCurrentTrackNumber;
@@ -1148,7 +1152,7 @@ void SubsessionIOState::setHintTrack(SubsessionIOState* hintedTrack,
 
 SyncFrame::SyncFrame(unsigned frameNum)
   : nextSyncFrame(NULL), sfFrameNum(frameNum) {
-}  
+}
 
 void Count64::operator+=(unsigned arg) {
   unsigned newLo = lo + arg;
@@ -2030,7 +2034,7 @@ addAtom(stss); // Sync-Sample
 
     while (currentSyncFrame != NULL) {
       if (currentSyncFrame->sfFrameNum >= totNumFrames) break; // sanity check
-      
+
       ++numEntries;
       size += addWord(currentSyncFrame->sfFrameNum);
       currentSyncFrame = currentSyncFrame->nextSyncFrame;
@@ -2044,7 +2048,7 @@ addAtom(stss); // Sync-Sample
       numSamplesSoFar += numSamples;
       chunk = chunk->fNextChunk;
     }
-  
+
     // Then, write out the sample numbers that we deem correspond to 'sync samples':
     unsigned i;
     for (i = 0; i < numSamplesSoFar; i += 12) {
@@ -2053,7 +2057,7 @@ addAtom(stss); // Sync-Sample
       size += addWord(i+1);
       ++numEntries;
     }
-  
+
     // Then, write out the last entry (if we haven't already done so):
     if (i != (numSamplesSoFar - 1)) {
       size += addWord(numSamplesSoFar);
