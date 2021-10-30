@@ -976,20 +976,32 @@ void createOutputFiles(char const* periodicFilenameSuffix) {
     } else {
       // Otherwise output to a type-specific file name, containing "periodicFilenameSuffix":
       char path[1024];
+      char shortPath[1024];
+      char shortOutFileName[1024];
+      char fileName[64];
       time_t now = time(0);
       tm *ltm = localtime(&now);
 
-      snprintf(path, sizeof path, "%s/%04d-%02d/%02d/%s",
-              fileNamePrefix, 1900 + ltm->tm_year,
-              1 + ltm->tm_mon, ltm->tm_mday, rtspSourceName);
+      snprintf(shortPath, sizeof shortPath, "%04d-%02d/%02d/%s",
+              1900 + ltm->tm_year, 1 + ltm->tm_mon,
+              ltm->tm_mday, rtspSourceName);
+
+      snprintf(path, sizeof path, "%s/%s",
+              fileNamePrefix, shortPath);
 
       mkpath(path, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
 
-      snprintf(outFileName, sizeof outFileName, "%s/%02d_%02d_%02d.%s",
-              path, ltm->tm_hour, ltm->tm_min, ltm->tm_sec,
+      snprintf(fileName, sizeof fileName, "%02d_%02d_%02d.%s",
+              ltm->tm_hour, ltm->tm_min, ltm->tm_sec,
               outputAVIFile ? "avi" : generateMP4Format ? "mp4" : "mov");
 
-      dbInsVideosRow(rtspSourceName, outFileName, fileOutputInterval);
+      snprintf(outFileName, sizeof outFileName, "%s/%s",
+               path, fileName);
+
+      snprintf(shortOutFileName, sizeof shortOutFileName, "%s/%s",
+               shortPath, fileName);
+
+      dbInsVideosRow(rtspSourceName, shortOutFileName, fileOutputInterval);
     }
 
     if (outputQuickTimeFile) {
